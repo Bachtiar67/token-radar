@@ -1,0 +1,22 @@
+{
+  "name": "token-radar",
+  "version": "1.0.0",
+  "description": "Token Radar - Pre-token protocols ranked by implied value",
+  "type": "module",
+  "main": "main.ts",
+  "scripts": {
+    "build": "node main.ts --input ../token-radar-01-kit/input/snapshot.json --output out",
+    "test": "node --test main.ts --input ../token-radar-01-kit/input/snapshot.json --output out 2>&1 | head -20",
+    "check": "node ../token-radar-01-kit/cli/makefun.mjs check --kit ../token-radar-01-kit --repo . --transcripts transcripts.tar.gz"
+  },
+  "keywords": [
+    "makefun",
+    "bounty",
+    "token-radar"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.65.1"
+  }
+}
