@@ -6,13 +6,20 @@
 // snapshot's live-token protocols are kept apart and shown as the market's own values, never mixed into
 // the ranked board.
 //
-// Implied value follows only from the snapshot's own figures:
-//
+// Smart composite scoring (v2):
 //   base       = tvl_usd x BASE_MULTIPLE
 //   growth     = clamp(change_7d, -60, 120) per cent
+//   momentum   = clamp(change_24h, -40, 80) per cent  (new: 24h liquidity momentum)
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
+//   momentumMult = 1 + (momentum / 100) x MOMENTUM_WEIGHT
 //   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   implied    = max(1, round(base x growthMult x maturity))
+//   implied    = max(1, round(base x growthMult x momentumMult x maturity))
+//
+// Status labels:
+//   SURGING   - growth > 30 AND momentum > 15
+//   STEADY    - growth > -10 AND momentum > -10
+//   HIGH RISK - growth < -30 OR momentum < -25
+//   NEUTRAL   - otherwise
 //
 // The constants are the house model's, stated in the dashboard and changeable in the model sandbox. No
 // protocol name is ever special-cased: the same function scores every row.
@@ -25,6 +32,7 @@ export interface SnapshotProtocol {
   chains: string[];
   tvl_usd: number;
   change_7d: number | null;
+  change_24h: number | null;
   mcap_usd: number | null;
   listed_at: string | null;
   gecko_id: string | null;
@@ -44,8 +52,11 @@ export interface Snapshot {
 export interface ModelConstants {
   base_multiple: number;
   growth_weight: number;
+  momentum_weight: number;
   growth_floor: number;
   growth_cap: number;
+  momentum_floor: number;
+  momentum_cap: number;
   maturity_floor: number;
   maturity_range: number;
   maturity_days: number;
@@ -55,8 +66,11 @@ export interface ModelConstants {
 export const MODEL: ModelConstants = {
   base_multiple: 0.25,
   growth_weight: 0.5,
+  momentum_weight: 0.25,
   growth_floor: -60,
   growth_cap: 120,
+  momentum_floor: -40,
+  momentum_cap: 80,
   maturity_floor: 0.6,
   maturity_range: 0.4,
   maturity_days: 1095,
@@ -64,13 +78,15 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-1';
+export const MODEL_VERSION = 'radar-2';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
+
+export type StatusLabel = 'SURGING' | 'STEADY' | 'HIGH RISK' | 'NEUTRAL';
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -88,6 +104,7 @@ export interface BoardRow {
   chains: string[];
   tvl_usd: number;
   change_7d: number | null;
+  change_24h: number | null;
   mcap_usd: number | null;
   listed_at: string | null;
   gecko_id: string | null;
@@ -95,10 +112,13 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  status_label: StatusLabel;
   model: {
     base_multiple: number;
     growth_pct: number;
     growth_multiplier: number;
+    momentum_pct: number;
+    momentum_multiplier: number;
     maturity_multiplier: number;
     age_days: number | null;
   };
@@ -114,12 +134,15 @@ export interface RadarRow {
   chains: string[];
   tvl_usd: number;
   change_7d: number | null;
+  change_24h: number | null;
   mcap_usd: number | null;
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
   growth_multiplier: number;
+  momentum_multiplier: number;
   maturity_multiplier: number;
+  status_label: StatusLabel;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -131,6 +154,7 @@ export interface LiveRow {
   tvl_usd: number;
   mcap_usd: number | null;
   change_7d: number | null;
+  change_24h: number | null;
 }
 
 /** Everything the dashboard needs: the board, the live set, and the model it runs. */
@@ -173,16 +197,35 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
 }
 
 /** The three multipliers and the implied value one protocol gets under `model`. */
-export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { 
+  implied: number; 
+  growthPct: number; 
+  growthMult: number; 
+  momentumPct: number;
+  momentumMult: number;
+  maturityMult: number; 
+  age: number | null;
+  statusLabel: StatusLabel;
+} {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
+  const rawMomentum = finite(protocol.change_24h, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
+  const momentumPct = Math.min(model.momentum_cap, Math.max(model.momentum_floor, rawMomentum));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const momentumMult = 1 + (momentumPct / 100) * model.momentum_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, growthPct, growthMult, maturityMult, age };
+  const implied = Math.max(1, Math.round(base * growthMult * momentumMult * maturityMult));
+  
+  // Status labels
+  let statusLabel: StatusLabel = 'NEUTRAL';
+  if (growthPct > 30 && momentumPct > 15) statusLabel = 'SURGING';
+  else if (growthPct > -10 && momentumPct > -10) statusLabel = 'STEADY';
+  else if (growthPct < -30 || momentumPct < -25) statusLabel = 'HIGH RISK';
+  
+  return { implied, growthPct, growthMult, momentumPct, momentumMult, maturityMult, age, statusLabel };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -230,8 +273,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model);
-    return { p, implied, growthPct, growthMult, maturityMult, age };
+    const { implied, growthPct, growthMult, momentumPct, momentumMult, maturityMult, age, statusLabel } = impliedValue(p, snapshot.as_of, model);
+    return { p, implied, growthPct, growthMult, momentumPct, momentumMult, maturityMult, age, statusLabel };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -242,6 +285,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     chains: s.p.chains,
     tvl_usd: s.p.tvl_usd,
     change_7d: s.p.change_7d,
+    change_24h: s.p.change_24h,
     mcap_usd: s.p.mcap_usd,
     listed_at: s.p.listed_at,
     gecko_id: s.p.gecko_id,
@@ -249,10 +293,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     token_status: 'pre-token',
     age_days: s.age,
     implied_value_usd: s.implied,
+    status_label: s.statusLabel,
     model: {
       base_multiple: model.base_multiple,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
+      momentum_pct: s.momentumPct,
+      momentum_multiplier: round4(s.momentumMult),
       maturity_multiplier: round4(s.maturityMult),
       age_days: s.age,
     },
@@ -365,6 +412,7 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
       tvl_usd: p.tvl_usd,
       mcap_usd: p.mcap_usd,
       change_7d: p.change_7d,
+      change_24h: p.change_24h,
     }));
 }
 
@@ -378,12 +426,15 @@ export function radarRow(row: BoardRow): RadarRow {
     chains: row.chains,
     tvl_usd: row.tvl_usd,
     change_7d: row.change_7d,
+    change_24h: row.change_24h,
     mcap_usd: row.mcap_usd,
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
     growth_multiplier: row.model.growth_multiplier,
+    momentum_multiplier: row.model.momentum_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    status_label: row.status_label,
   };
 }
 
@@ -436,6 +487,7 @@ export function parseSnapshot(text: string): Snapshot {
       chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
       tvl_usd: p.tvl_usd,
       change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
+      change_24h: typeof p.change_24h === 'number' && Number.isFinite(p.change_24h) ? p.change_24h : null,
       mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
       listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
       gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,

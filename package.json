@@ -1,7 +1,7 @@
 {
   "name": "token-radar",
-  "version": "1.0.0",
-  "description": "Token Radar - Pre-token protocols ranked by implied value",
+  "version": "2.0.0",
+  "description": "Token Radar - Pre-token protocols ranked by implied value with smart scoring and production UI",
   "type": "module",
   "main": "main.ts",
   "scripts": {
@@ -16,7 +16,5 @@
   ],
   "author": "",
   "license": "MIT",
-  "dependencies": {
-    "playwright": "^1.65.1"
-  }
+  "dependencies": {}
 }
